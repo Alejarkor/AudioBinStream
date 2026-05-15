@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -18,12 +19,13 @@ from typing import Callable, Optional
 logger = logging.getLogger(__name__)
 
 SERVICE_NAME = "audio_binaural"
+PUSH_TRANSPORTS = {"raw_udp", "rtp"}
 
 CAPABILITIES = {
     "service": SERVICE_NAME,
     "actions": ["start", "stop", "restart", "mute", "unmute", "get_state", "apply_config"],
     "config_schema": {
-        "protocol": {"type": "enum", "values": ["raw_udp", "rtp", "tcp_server"]},
+        "protocol": {"type": "enum", "values": ["raw_udp", "rtp"]},
         "dest_ip": {"type": "string"},
         "dest_port": {"type": "integer", "min": 1, "max": 65535},
         "stream_bind_ip": {"type": "string"},
@@ -85,6 +87,7 @@ class AudioCaptureServiceAdapter:
             "service": SERVICE_NAME,
             "status": "OFFLINE",
             "healthy": False,
+            "pid": os.getpid(),
             "ts": _now_iso(),
         })
         client.will_set(cfg.mqtt_state_topic, payload=lwt_payload, qos=1, retain=True)
@@ -98,8 +101,12 @@ class AudioCaptureServiceAdapter:
             client.connect(cfg.mqtt_broker, cfg.mqtt_port, cfg.mqtt_keepalive)
         except (OSError, ConnectionRefusedError) as e:
             logger.error(f"No se puede conectar al broker MQTT {cfg.mqtt_broker}:{cfg.mqtt_port}: {e}")
+            self._client = None
+            return False
         except Exception as e:
             logger.error(f"Error MQTT inesperado: {e}")
+            self._client = None
+            return False
 
         client.loop_start()
         logger.info(f"MQTT adapter iniciado → {cfg.mqtt_broker}:{cfg.mqtt_port}")
@@ -141,7 +148,7 @@ class AudioCaptureServiceAdapter:
         self._publish(self._cfg.mqtt_state_topic, payload, qos=1, retain=True)
 
     def publish_config_reported(self, cfg) -> None:
-        payload = {"service": SERVICE_NAME, "config": cfg.to_dict(), "ts": _now_iso()}
+        payload = {"service": SERVICE_NAME, "config": cfg.to_report_dict(), "ts": _now_iso()}
         self._publish(self._cfg.mqtt_config_reported_topic, payload, qos=1, retain=True)
 
     def publish_capabilities(self, rode_available: bool = False, rode_mode: Optional[str] = None) -> None:
@@ -165,6 +172,7 @@ class AudioCaptureServiceAdapter:
             "sample_rate": cfg.sample_rate,
             "bit_depth": cfg.bit_depth,
             "mode": cfg.mqtt_rode_mode,
+            "pid": os.getpid(),
             "ts": _now_iso(),
         }
         self._publish(self._cfg.mqtt_endpoint_topic, payload, qos=1, retain=True)
@@ -175,6 +183,7 @@ class AudioCaptureServiceAdapter:
             "transport": cfg.protocol,
             "dest_ip": cfg.dest_ip,
             "dest_port": cfg.dest_port,
+            "pid": os.getpid(),
             "source": source,
             "ts": _now_iso(),
         }
@@ -187,6 +196,7 @@ class AudioCaptureServiceAdapter:
             "event": event,
             "service": SERVICE_NAME,
             "details": details or {},
+            "pid": os.getpid(),
             "ts": _now_iso(),
         }
         self._publish(self._cfg.mqtt_events_topic, payload, qos=qos)
@@ -299,19 +309,38 @@ class AudioCaptureServiceAdapter:
     def _handle_stream_target_desired(self, payload: dict) -> None:
         sink = payload.get("sink", payload)
         delta = {}
+
         if "ip" in sink:
             delta["dest_ip"] = sink["ip"]
         elif "dest_ip" in sink:
             delta["dest_ip"] = sink["dest_ip"]
+
         if "port" in sink:
-            delta["dest_port"] = sink["port"]
+            try:
+                delta["dest_port"] = int(sink["port"])
+            except (TypeError, ValueError):
+                logger.warning(f"stream_target/desired con port inválido: {sink.get('port')!r}")
+                self.publish_event("stream_target_invalid", severity="warning", details={"reason": "invalid_port", "raw": payload})
+                return
         elif "dest_port" in sink:
-            delta["dest_port"] = sink["dest_port"]
+            try:
+                delta["dest_port"] = int(sink["dest_port"])
+            except (TypeError, ValueError):
+                logger.warning(f"stream_target/desired con dest_port inválido: {sink.get('dest_port')!r}")
+                self.publish_event("stream_target_invalid", severity="warning", details={"reason": "invalid_dest_port", "raw": payload})
+                return
+
         if "transport" in sink:
-            delta["protocol"] = sink["transport"]
+            transport = str(sink["transport"]).strip().lower()
+            if transport not in PUSH_TRANSPORTS:
+                logger.warning(f"stream_target/desired con transport no soportado: {transport}")
+                self.publish_event("stream_target_invalid", severity="warning", details={"reason": "unsupported_transport", "transport": transport, "raw": payload})
+                return
+            delta["protocol"] = transport
 
         if not delta:
             logger.warning("stream_target/desired recibido sin ip/port")
+            self.publish_event("stream_target_invalid", severity="warning", details={"reason": "empty_delta", "raw": payload})
             return
 
         logger.info(f"Nuevo destino de stream por MQTT: {delta}")

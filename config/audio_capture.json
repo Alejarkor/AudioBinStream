@@ -1,0 +1,18 @@
+{
+  "protocol": "raw_udp",
+  "dest_ip": "192.168.28.92",
+  "dest_port": 1234,
+  "stream_bind_ip": "0.0.0.0",
+  "stream_port": 5004,
+  "sample_rate": 48000,
+  "channels": 2,
+  "bit_depth": 16,
+  "gain_db": 0.0,
+  "muted": false,
+  "device_name": "AI-Micro",
+  "alsa_device_override": null,
+  "rode_mode": "SPLIT",
+  "rode_auto_set_mode": true,
+  "alsa_buffer_time_us": 100,
+  "pipeline_queue_ms": 1
+}

@@ -1,0 +1,25 @@
+# Dependencias Python del Audio Capture Service
+# Instalación: pip install -r requirements.txt --break-system-packages
+
+# Control MQTT
+paho-mqtt>=1.6.0
+
+# Control USB del RODE AI-Micro
+pyusb>=1.2.1
+
+# Opcional — descubrimiento de dispositivos por sounddevice
+# sounddevice>=0.4.0
+
+# Notas sobre dependencias de sistema (no instalables via pip):
+#
+# PyGObject / GStreamer Python bindings:
+#   sudo apt install python3-gi python3-gst-1.0
+#
+# GStreamer plugins necesarios:
+#   sudo apt install gstreamer1.0-alsa gstreamer1.0-plugins-good gstreamer1.0-plugins-base
+#
+# ALSA utils (arecord, aplay):
+#   sudo apt install alsa-utils
+#
+# pyusb puede necesitar reglas udev para acceso sin root:
+#   Ver README de instalación

@@ -1,0 +1,41 @@
+[Unit]
+Description=Nexor Audio Capture & Streaming Service
+Documentation=https://confluence.itcl.es/display/...
+After=network-online.target sound.target
+Wants=network-online.target
+# El broker MQTT debe estar accesible — no añadimos dependencia dura
+# para que el servicio arranque aunque el broker remoto no esté disponible
+# al inicio (el adapter MQTT reintentará la conexión)
+
+[Service]
+Type=simple
+User=nexor
+Group=audio
+
+# Fichero de variables de entorno con credenciales y configuración de red
+# (no incluir en el repo — copiarlo manualmente en la Jetson)
+EnvironmentFile=-/etc/nexor/audio_capture.env
+
+# Ruta de la config JSON persistente (desired config)
+Environment="AUDIO_CAPTURE_CONFIG=/etc/nexor/audio_capture.json"
+
+WorkingDirectory=/opt/nexor/audio_capture_service
+ExecStart=/usr/bin/python3 -m audio_capture_service --log-level INFO
+
+# Restart automático en caso de fallo
+Restart=on-failure
+RestartSec=5
+# Limitar reintentos rápidos: máx 5 reinicios en 60 segundos
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Logging a journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=audio-capture
+
+# Timeout de parada gracioso
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

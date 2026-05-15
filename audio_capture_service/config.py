@@ -31,6 +31,11 @@ DEFAULT_CONFIG_PATH = os.environ.get(
     "/etc/nexor/audio_capture.json"
 )
 
+PUBLIC_REPORTED_CONFIG_EXCLUDE_KEYS = {
+    "mqtt_user",
+    "mqtt_password",
+}
+
 
 @dataclass
 class AudioCaptureConfig:
@@ -80,6 +85,12 @@ class AudioCaptureConfig:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def to_report_dict(self) -> dict:
+        data = self.to_dict()
+        for key in PUBLIC_REPORTED_CONFIG_EXCLUDE_KEYS:
+            data.pop(key, None)
+        return data
 
     @classmethod
     def from_dict(cls, d: dict) -> "AudioCaptureConfig":

@@ -1,9 +1,5 @@
 """
 mqtt_adapter.py — Adaptador MQTT del servicio de audio binaural Nexor.
-
-El servicio podía funcionar de forma autónoma para pruebas, pero se preparaba
-para integrarse después con el serviceManager. En esta iteración se añadía un
-canal explícito para fijar el destino UDP del stream por MQTT.
 """
 
 from __future__ import annotations
@@ -46,6 +42,13 @@ CAPABILITIES = {
         "gain_db": {"type": "float", "min": -20.0, "max": 20.0},
         "muted": {"type": "boolean"},
         "rode_mode": {"type": "enum", "values": ["split", "merged", "stereo"]},
+        "aec_enabled": {"type": "boolean"},
+        "aec_reference_bus_path": {"type": "string"},
+        "aec_frame_ms": {"type": "enum", "values": [10, 20]},
+        "aec_search_frames": {"type": "integer", "min": 1, "max": 64},
+        "aec_strength": {"type": "float", "min": 0.0, "max": 3.0},
+        "aec_max_gain": {"type": "float", "min": 0.1, "max": 8.0},
+        "aec_smoothing": {"type": "float", "min": 0.0, "max": 0.99}
     },
     "stream_target_schema": {
         "ip": {"type": "string"},
@@ -151,6 +154,7 @@ class AudioCaptureServiceAdapter:
             "transport": self._cfg.protocol,
             "mode": self._cfg.mqtt_rode_mode,
             "muted": self._cfg.muted,
+            "aec_enabled": self._cfg.aec_enabled,
             "ts": _now_iso(),
         }
         if pid is not None:
@@ -168,6 +172,7 @@ class AudioCaptureServiceAdapter:
     def publish_capabilities(self, rode_available: bool = False, rode_mode: Optional[str] = None) -> None:
         caps = dict(CAPABILITIES)
         caps["rode_detected"] = rode_available
+        caps["aec_shared_bus"] = True
         if rode_mode:
             caps["rode_mode"] = rode_mode.lower()
         caps["ts"] = _now_iso()
@@ -186,6 +191,7 @@ class AudioCaptureServiceAdapter:
             "sample_rate": cfg.sample_rate,
             "bit_depth": cfg.bit_depth,
             "mode": cfg.mqtt_rode_mode,
+            "aec_enabled": cfg.aec_enabled,
             "pid": os.getpid(),
             "ts": _now_iso(),
         }

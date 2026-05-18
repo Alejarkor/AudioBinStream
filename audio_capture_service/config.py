@@ -6,14 +6,6 @@ La configuración del servicio se persistía en JSON (desired config del propio
 servicio), mientras que la configuración común del nodo se cargaba desde un
 fichero general separado. De esa forma podía compartirse la conexión MQTT y la
 identidad del nodo entre varios servicios Nexor.
-
-Variables de entorno reconocidas (sobreescriben el JSON del servicio):
-    AUDIO_CAPTURE_CONFIG, AUDIO_DEST_IP, AUDIO_DEST_PORT,
-    STREAM_BIND_IP, STREAM_PORT, RODE_MODE
-
-Variables de entorno del nodo común (normalmente definidas en otro fichero):
-    NODE_ID, MQTT_NAMESPACE, MQTT_BROKER, MQTT_PORT, MQTT_USER,
-    MQTT_PASSWORD, NEXOR_ADVERTISE_HOST
 """
 
 from __future__ import annotations
@@ -39,36 +31,24 @@ PUBLIC_REPORTED_CONFIG_EXCLUDE_KEYS = {
 
 @dataclass
 class AudioCaptureConfig:
-    # ── Transporte / streaming ────────────────────────────────────────────────
-    # raw_udp    → PCM en bruto sobre UDP hacia un destino configurado.
-    # rtp        → RTP sobre UDP hacia un destino configurado.
-    # tcp_server → compatibilidad opcional. No era el modo preferido.
     protocol: str = "raw_udp"
-
-    # Para protocolos de tipo push (raw_udp / rtp)
     dest_ip: str = "192.168.0.20"
     dest_port: int = 1234
-
-    # Para protocolo servidor (tcp_server)
     stream_bind_ip: str = "0.0.0.0"
     stream_port: int = 5004
 
-    # ── Audio ─────────────────────────────────────────────────────────────────
     sample_rate: int = 48000
     channels: int = 2
-    bit_depth: int = 24
+    bit_depth: int = 16
     gain_db: float = 0.0
     muted: bool = False
 
-    # ── Dispositivo ───────────────────────────────────────────────────────────
     device_name: str = "AI-Micro"
     alsa_device_override: Optional[str] = None
 
-    # ── RODE AI-Micro ─────────────────────────────────────────────────────────
     rode_mode: str = "SPLIT"
     rode_auto_set_mode: bool = True
 
-    # ── Configuración común heredada del nodo ────────────────────────────────
     mqtt_broker: str = "127.0.0.1"
     mqtt_port: int = 1883
     mqtt_user: str = ""
@@ -79,9 +59,16 @@ class AudioCaptureConfig:
     mqtt_namespace: str = "nexor/v1"
     advertise_host: str = "127.0.0.1"
 
-    # ── Pipeline ──────────────────────────────────────────────────────────────
     alsa_buffer_time_us: int = 5000
     pipeline_queue_ms: int = 5
+
+    aec_enabled: bool = True
+    aec_reference_bus_path: str = "/tmp/nexor_audio_reference_bus"
+    aec_frame_ms: int = 10
+    aec_search_frames: int = 6
+    aec_strength: float = 1.0
+    aec_max_gain: float = 2.5
+    aec_smoothing: float = 0.75
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -137,7 +124,9 @@ class AudioCaptureConfig:
 
     def save(self, path: str = DEFAULT_CONFIG_PATH) -> None:
         path = path or DEFAULT_CONFIG_PATH
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
         tmp = path + ".tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as f:
@@ -281,6 +270,14 @@ class AudioCaptureConfig:
                 errors.append("dest_ip vacío")
             if not (1 <= self.dest_port <= 65535):
                 errors.append(f"dest_port inválido: {self.dest_port}")
+        if self.aec_enabled and self.protocol != "raw_udp":
+            errors.append("aec_enabled requiere protocol=raw_udp")
+        if self.aec_enabled and self.bit_depth != 16:
+            errors.append("aec_enabled requiere bit_depth=16")
+        if self.aec_enabled and self.channels != 2:
+            errors.append("aec_enabled requiere channels=2 para captura estéreo")
+        if self.aec_frame_ms not in (10, 20):
+            errors.append(f"aec_frame_ms inválido: {self.aec_frame_ms}")
         if not self.node_id:
             errors.append("node_id vacío")
         if not self.mqtt_namespace:

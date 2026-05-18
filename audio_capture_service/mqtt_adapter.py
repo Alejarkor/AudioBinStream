@@ -23,7 +23,17 @@ PUSH_TRANSPORTS = {"raw_udp", "rtp"}
 
 CAPABILITIES = {
     "service": SERVICE_NAME,
-    "actions": ["start", "stop", "restart", "mute", "unmute", "get_state", "apply_config"],
+    "actions": [
+        "start",
+        "resume",
+        "standby",
+        "stop",
+        "restart",
+        "mute",
+        "unmute",
+        "get_state",
+        "apply_config",
+    ],
     "config_schema": {
         "protocol": {"type": "enum", "values": ["raw_udp", "rtp"]},
         "dest_ip": {"type": "string"},
@@ -52,6 +62,8 @@ def _now_iso() -> str:
 class AudioCaptureServiceAdapter:
     def __init__(self, cfg,
                  on_start: Optional[Callable] = None,
+                 on_resume: Optional[Callable] = None,
+                 on_standby: Optional[Callable] = None,
                  on_stop: Optional[Callable] = None,
                  on_restart: Optional[Callable] = None,
                  on_mute: Optional[Callable[[bool], None]] = None,
@@ -63,6 +75,8 @@ class AudioCaptureServiceAdapter:
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._on_start = on_start or (lambda: None)
+        self._on_resume = on_resume or self._on_start
+        self._on_standby = on_standby or (lambda: None)
         self._on_stop = on_stop or (lambda: None)
         self._on_restart = on_restart or (lambda: None)
         self._on_mute = on_mute or (lambda m: None)
@@ -249,6 +263,8 @@ class AudioCaptureServiceAdapter:
 
         handlers = {
             "start": self._cmd_start,
+            "resume": self._cmd_resume,
+            "standby": self._cmd_standby,
             "stop": self._cmd_stop,
             "restart": self._cmd_restart,
             "mute": self._cmd_mute,
@@ -269,6 +285,14 @@ class AudioCaptureServiceAdapter:
     def _cmd_start(self, params: dict, msg_id: str) -> None:
         self.publish_event("start_requested", details={"msg_id": msg_id})
         self._on_start()
+
+    def _cmd_resume(self, params: dict, msg_id: str) -> None:
+        self.publish_event("resume_requested", details={"msg_id": msg_id})
+        self._on_resume()
+
+    def _cmd_standby(self, params: dict, msg_id: str) -> None:
+        self.publish_event("standby_requested", details={"msg_id": msg_id})
+        self._on_standby()
 
     def _cmd_stop(self, params: dict, msg_id: str) -> None:
         self.publish_event("stop_requested", details={"msg_id": msg_id})

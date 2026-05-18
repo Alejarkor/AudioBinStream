@@ -48,6 +48,7 @@ class AudioCaptureService:
         self._config_path: Optional[str] = None
         self._waiting_for_target = False
         self._stream_target_confirmed = False
+        self._idle = False
 
         self._pipeline = AudioPipeline(
             on_state_change=self._on_pipeline_state_change,
@@ -56,6 +57,8 @@ class AudioCaptureService:
         self._mqtt = AudioCaptureServiceAdapter(
             cfg=cfg,
             on_start=self._handle_start,
+            on_resume=self._handle_resume,
+            on_standby=self._handle_standby,
             on_stop=self._handle_stop,
             on_restart=self._handle_restart,
             on_mute=self._handle_mute,
@@ -121,6 +124,7 @@ class AudioCaptureService:
         if self._requires_stream_target() and not self._simulate:
             self._waiting_for_target = True
             self._stream_target_confirmed = False
+            self._idle = False
             self._mqtt.publish_state("WAITING_TARGET", healthy=True, pid=os.getpid())
             self._mqtt.publish_event(
                 "waiting_for_target",
@@ -158,6 +162,8 @@ class AudioCaptureService:
                             time.sleep(3.0)
                             if self._waiting_for_target and not self._stream_target_confirmed:
                                 logger.info("Pipeline en ERROR pero el servicio sigue en WAITING_TARGET")
+                            elif self._idle:
+                                logger.info("Pipeline en ERROR pero el servicio sigue en IDLE")
                             else:
                                 self._pipeline.restart(self._cfg)
                         else:
@@ -188,12 +194,14 @@ class AudioCaptureService:
     def _runtime_status(self) -> str:
         if self._waiting_for_target:
             return "WAITING_TARGET"
+        if self._idle:
+            return "IDLE"
         if self._simulate:
             return "RUNNING"
         return self._pipeline.state
 
     def _runtime_healthy(self) -> bool:
-        if self._waiting_for_target:
+        if self._waiting_for_target or self._idle:
             return True
         if self._simulate:
             return True
@@ -204,6 +212,7 @@ class AudioCaptureService:
             logger.info(f"[SIMULATE] start_pipeline(trigger={trigger})")
             self._start_time = time.monotonic()
             self._waiting_for_target = False
+            self._idle = False
             self._mqtt.publish_state("RUNNING", healthy=True, pid=os.getpid())
             self._mqtt.publish_config_reported(self._cfg)
             self._mqtt.publish_endpoint(self._cfg)
@@ -221,6 +230,7 @@ class AudioCaptureService:
         self._start_time = time.monotonic()
         self._pipeline_restart_count = 0
         self._waiting_for_target = False
+        self._idle = False
         self._mqtt.publish_state("RUNNING", healthy=True, pid=os.getpid())
         self._mqtt.publish_config_reported(self._cfg)
         self._mqtt.publish_endpoint(self._cfg)
@@ -233,6 +243,8 @@ class AudioCaptureService:
             logger.info(f"[SIMULATE] restart_pipeline(trigger={trigger})")
             self._start_time = time.monotonic()
             self._pipeline_restart_count = 0
+            self._waiting_for_target = False
+            self._idle = False
             self._mqtt.publish_state("RUNNING", healthy=True, pid=os.getpid())
             self._mqtt.publish_config_reported(self._cfg)
             self._mqtt.publish_endpoint(self._cfg)
@@ -249,6 +261,8 @@ class AudioCaptureService:
 
         self._start_time = time.monotonic()
         self._pipeline_restart_count = 0
+        self._waiting_for_target = False
+        self._idle = False
         self._mqtt.publish_state("RUNNING", healthy=True, pid=os.getpid())
         self._mqtt.publish_config_reported(self._cfg)
         self._mqtt.publish_endpoint(self._cfg)
@@ -296,33 +310,75 @@ class AudioCaptureService:
         return None
 
     def _handle_start(self) -> None:
+        self._handle_resume()
+
+    def _handle_resume(self) -> None:
         if self._simulate:
-            logger.info("[SIMULATE] start()")
+            logger.info("[SIMULATE] resume()")
+            self._waiting_for_target = False
+            self._idle = False
             self._mqtt.publish_state("RUNNING", healthy=True)
             return
 
         if self._waiting_for_target and not self._stream_target_confirmed:
-            logger.info("start() ignorado — sigue en WAITING_TARGET")
+            logger.info("resume() ignorado — sigue en WAITING_TARGET")
             self._mqtt.publish_state("WAITING_TARGET", healthy=True, pid=os.getpid())
-            self._mqtt.publish_event("service_start_blocked", severity="warning", details={"reason": "stream_target_not_confirmed"})
+            self._mqtt.publish_event("service_resume_blocked", severity="warning", details={"reason": "stream_target_not_confirmed"})
+            return
+
+        if self._idle:
+            logger.info("Reanudando servicio desde IDLE")
+            if self._pipeline.state in (PipelineState.STOPPED, PipelineState.ERROR):
+                self._start_pipeline(trigger="resume_command")
+            else:
+                self._idle = False
+                self._mqtt.publish_state("RUNNING", healthy=True, pid=os.getpid())
+                self._mqtt.publish_event("service_resumed", details={"trigger": "resume_command", "pid": os.getpid()})
             return
 
         if self._pipeline.state in (PipelineState.STOPPED, PipelineState.ERROR):
-            self._start_pipeline(trigger="mqtt_command")
+            self._start_pipeline(trigger="start_command")
+
+    def _handle_standby(self) -> None:
+        if self._simulate:
+            logger.info("[SIMULATE] standby()")
+            self._idle = True
+            self._waiting_for_target = False
+            self._mqtt.publish_state("IDLE", healthy=True)
+            self._mqtt.publish_event("service_standby", details={"trigger": "mqtt_command"})
+            return
+
+        if self._pipeline.state not in (PipelineState.STOPPED,):
+            self._pipeline.stop()
+
+        self._start_time = None
+        self._idle = True
+        self._waiting_for_target = False
+        self._mqtt.publish_state("IDLE", healthy=True, pid=os.getpid())
+        self._mqtt.publish_config_reported(self._cfg)
+        self._mqtt.publish_endpoint(self._cfg)
+        self._mqtt.publish_stream_target(self._cfg, source="standby")
+        self._mqtt.publish_event("service_standby", details={"trigger": "mqtt_command", "target_confirmed": self._stream_target_confirmed})
 
     def _handle_stop(self) -> None:
         if self._simulate:
             logger.info("[SIMULATE] stop()")
+            self._idle = False
+            self._waiting_for_target = False
             self._mqtt.publish_state("STOPPED", healthy=False)
             return
         self._pipeline.stop()
         self._start_time = None
+        self._idle = False
+        self._waiting_for_target = False
         self._mqtt.publish_state("STOPPED", healthy=False)
         self._mqtt.publish_event("service_stopped", details={"trigger": "mqtt_command"})
 
     def _handle_restart(self) -> None:
         if self._simulate:
             logger.info("[SIMULATE] restart()")
+            self._idle = False
+            self._waiting_for_target = False
             self._mqtt.publish_state("RUNNING", healthy=True)
             return
 
@@ -403,14 +459,18 @@ class AudioCaptureService:
             if self._pipeline.state in (PipelineState.RUNNING, PipelineState.PAUSED):
                 logger.info(f"Reiniciando pipeline por cambio de config: {list(cold_changes.keys())}")
                 self._restart_pipeline(trigger="config_applied")
-            elif self._pipeline.state in (PipelineState.STOPPED, PipelineState.ERROR) and not self._waiting_for_target and self._stream_target_confirmed:
+            elif self._pipeline.state in (PipelineState.STOPPED, PipelineState.ERROR) and not self._waiting_for_target and not self._idle and self._stream_target_confirmed:
                 logger.info("Config aplicada con pipeline parado y target confirmado — arrancando pipeline")
                 self._start_pipeline(trigger="config_applied")
+            elif self._idle:
+                logger.info(f"Config aplicada mientras el servicio estaba en IDLE: {list(cold_changes.keys())}")
         elif cold_changes and self._simulate:
             logger.info(f"[SIMULATE] Cambio de config (no reinicia pipeline): {list(cold_changes.keys())}")
 
         if self._waiting_for_target and not self._stream_target_confirmed:
             self._mqtt.publish_state("WAITING_TARGET", healthy=True, pid=os.getpid())
+        elif self._idle:
+            self._mqtt.publish_state("IDLE", healthy=True, pid=os.getpid())
 
         self._mqtt.publish_config_reported(self._cfg)
         self._mqtt.publish_endpoint(self._cfg)
@@ -422,6 +482,9 @@ class AudioCaptureService:
         logger.debug(f"Pipeline state → {new_state}")
         if self._waiting_for_target:
             status = "WAITING_TARGET"
+            healthy = True
+        elif self._idle:
+            status = "IDLE"
             healthy = True
         else:
             status = new_state

@@ -11,7 +11,7 @@ from typing import Optional
 from .pcm import PcmAudioFormat
 
 MAGIC = b"NEXRAU1\0"
-HEADER_STRUCT = struct.Struct("<8sIIIIQQII")
+HEADER_STRUCT = struct.Struct("<8sIIIIIQQII")
 # magic, version, frame_bytes, capacity_frames, channels, sample_rate, write_seq, last_ts_ns, bit_depth, write_index
 VERSION = 1
 

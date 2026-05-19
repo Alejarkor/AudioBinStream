@@ -42,19 +42,9 @@ class AudioCaptureService:
         self._stream_target_confirmed = False
         self._idle = False
 
-        if cfg.aec_enabled and not simulate:
-            self._pipeline = AecAudioPipeline(
-                on_state_change=self._on_pipeline_state_change,
-                on_error=self._on_pipeline_error,
-            )
-            self._pipeline_state_enum = AecPipelineState
-            logger.info("AEC compartido activado para audio_binaural")
-        else:
-            self._pipeline = AudioPipeline(
-                on_state_change=self._on_pipeline_state_change,
-                on_error=self._on_pipeline_error,
-            )
-            self._pipeline_state_enum = PipelineState
+        self._pipeline = None
+        self._pipeline_state_enum = PipelineState
+        self._rebuild_pipeline_for_cfg(cfg)
 
         self._mqtt = AudioCaptureServiceAdapter(
             cfg=cfg,
@@ -73,6 +63,29 @@ class AudioCaptureService:
 
     def set_config_path(self, path: Optional[str]) -> None:
         self._config_path = path
+
+    def _rebuild_pipeline_for_cfg(self, cfg: AudioCaptureConfig) -> None:
+        old_pipeline = getattr(self, "_pipeline", None)
+        if old_pipeline is not None and not self._simulate:
+            try:
+                old_pipeline.stop()
+            except Exception as e:
+                logger.debug(f"Error deteniendo pipeline anterior durante rebuild: {e}")
+
+        if cfg.aec_enabled and not self._simulate:
+            self._pipeline = AecAudioPipeline(
+                on_state_change=self._on_pipeline_state_change,
+                on_error=self._on_pipeline_error,
+            )
+            self._pipeline_state_enum = AecPipelineState
+            logger.info("AEC compartido activado para audio_binaural")
+        else:
+            self._pipeline = AudioPipeline(
+                on_state_change=self._on_pipeline_state_change,
+                on_error=self._on_pipeline_error,
+            )
+            self._pipeline_state_enum = PipelineState
+            logger.info("Pipeline clásico activado para audio_binaural")
 
     def run(self) -> int:
         logger.info("=" * 60)
@@ -427,6 +440,7 @@ class AudioCaptureService:
         hot_changes = {k: v for k, v in delta.items() if k in hot_fields}
         cold_changes = {k: v for k, v in delta.items() if k not in hot_fields}
         target_changes = {k: v for k, v in delta.items() if k in target_fields}
+        aec_toggle_changed = new_cfg.aec_enabled != self._cfg.aec_enabled
 
         if target_changes and new_cfg.is_push_transport:
             self._stream_target_confirmed = True
@@ -448,6 +462,11 @@ class AudioCaptureService:
 
         self._cfg = new_cfg
         self._mqtt._cfg = new_cfg
+
+        if aec_toggle_changed:
+            logger.info(f"Cambio de AEC detectado por MQTT: {'on' if new_cfg.aec_enabled else 'off'}")
+            self._rebuild_pipeline_for_cfg(new_cfg)
+
         if self._config_path:
             self._cfg.save(self._config_path)
         else:

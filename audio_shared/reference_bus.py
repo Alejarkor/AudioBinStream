@@ -103,33 +103,47 @@ class AudioReferenceBus:
         directory = os.path.dirname(self.path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        size = HEADER_STRUCT.size + (self.frame_bytes * self.capacity_frames)
+
         self._fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o666)
         current_size = os.path.getsize(self.path)
-        if current_size != size:
-            os.ftruncate(self._fd, size)
-        self._mmap = mmap.mmap(self._fd, size)
-        if not self._is_valid_header():
-            self._initialize_header()
 
-    def _is_valid_header(self) -> bool:
-        self._mmap.seek(0)
-        raw = self._mmap.read(HEADER_STRUCT.size)
-        if len(raw) != HEADER_STRUCT.size:
+        if self._try_adopt_existing_layout(current_size):
+            return
+
+        size = HEADER_STRUCT.size + (self.frame_bytes * self.capacity_frames)
+        os.ftruncate(self._fd, size)
+        self._mmap = mmap.mmap(self._fd, size)
+        self._initialize_header()
+
+    def _try_adopt_existing_layout(self, current_size: int) -> bool:
+        if current_size < HEADER_STRUCT.size:
             return False
+
         try:
+            raw = os.pread(self._fd, HEADER_STRUCT.size, 0)
             header = HEADER_STRUCT.unpack(raw)
-        except struct.error:
+        except Exception:
             return False
-        return (
-            header[0] == MAGIC
-            and header[1] == VERSION
-            and header[2] == self.frame_bytes
-            and header[3] == self.capacity_frames
-            and header[4] == self.audio_format.channels
-            and header[5] == self.audio_format.sample_rate
-            and header[8] == self.audio_format.bit_depth
-        )
+
+        if header[0] != MAGIC or header[1] != VERSION:
+            return False
+        if header[2] != self.frame_bytes:
+            return False
+        if header[4] != self.audio_format.channels:
+            return False
+        if header[5] != self.audio_format.sample_rate:
+            return False
+        if header[8] != self.audio_format.bit_depth:
+            return False
+
+        existing_capacity = int(header[3])
+        expected_size = HEADER_STRUCT.size + (existing_capacity * self.frame_bytes)
+        if current_size != expected_size:
+            return False
+
+        self.capacity_frames = existing_capacity
+        self._mmap = mmap.mmap(self._fd, current_size)
+        return True
 
     def _initialize_header(self) -> None:
         header = HEADER_STRUCT.pack(

@@ -18,13 +18,13 @@ import signal
 import sys
 import time
 import threading
+from dataclasses import replace
 from typing import Optional
 
-from .config import AudioCaptureConfig
+from .config import AudioCaptureConfig, DEFAULT_CONFIG_PATH
 from .device_discovery import find_alsa_device_by_name, list_alsa_capture_devices
 from .pipeline import AudioPipeline, PipelineState
 from .mqtt_adapter import AudioCaptureServiceAdapter
-from .node_runtime import NexorNodeRuntimeConfig
 from .rode_controller import RodeController, RodeControllerError
 
 logging.basicConfig(
@@ -113,7 +113,7 @@ class AudioCaptureService:
                 self._mqtt.publish_event("service_start_failed", severity="error", details={"reason": "alsa_device_not_found"})
                 self._mqtt.stop()
                 return 1
-            self._cfg.alsa_device_override = alsa_id
+            self._cfg = replace(self._cfg, alsa_device_override=alsa_id)
         else:
             logger.info("[SIMULATE] Saltando resolución de dispositivo ALSA")
 
@@ -121,7 +121,9 @@ class AudioCaptureService:
         self._mqtt.publish_endpoint(self._cfg)
         self._mqtt.publish_stream_target(self._cfg, source="startup_unconfirmed")
 
-        if self._requires_stream_target() and not self._simulate:
+        if self._requires_stream_target() and not self._simulate and (
+            self._cfg.wait_for_mqtt_target or not self._cfg.has_stream_target
+        ):
             self._waiting_for_target = True
             self._stream_target_confirmed = False
             self._idle = False
@@ -144,7 +146,8 @@ class AudioCaptureService:
 
         try:
             while not self._shutdown_event.is_set():
-                self._shutdown_event.wait(timeout=5.0)
+                self._mqtt.process_pending()
+                self._shutdown_event.wait(timeout=self._cfg.heartbeat_seconds)
                 if self._mqtt.is_connected():
                     self._mqtt.publish_state(
                         status=self._runtime_status(),
@@ -291,10 +294,6 @@ class AudioCaptureService:
             return False, None
 
     def _resolve_alsa_device(self) -> Optional[str]:
-        if self._cfg.alsa_device_override:
-            logger.info(f"Usando dispositivo ALSA override: {self._cfg.alsa_device_override}")
-            return self._cfg.alsa_device_override
-
         alsa_id = find_alsa_device_by_name(self._cfg.device_name)
         if alsa_id:
             logger.info(f"Dispositivo ALSA resuelto: '{self._cfg.device_name}' → {alsa_id}")
@@ -393,12 +392,14 @@ class AudioCaptureService:
     def _handle_mute(self, muted: bool) -> None:
         if self._simulate:
             logger.info(f"[SIMULATE] {'mute' if muted else 'unmute'}()")
-            self._cfg.muted = muted
+            self._cfg = replace(self._cfg, muted=muted)
+            self._mqtt._cfg = self._cfg
             self._mqtt.publish_state("PAUSED" if muted else "RUNNING", healthy=True)
             return
         ok = self._pipeline.set_mute(muted)
         if ok:
-            self._cfg.muted = muted
+            self._cfg = replace(self._cfg, muted=muted)
+            self._mqtt._cfg = self._cfg
             status = "PAUSED" if muted else "RUNNING"
             self._mqtt.publish_state(status, healthy=True, pid=os.getpid(), uptime_s=self._uptime_seconds())
             self._mqtt.publish_config_reported(self._cfg)
@@ -409,23 +410,17 @@ class AudioCaptureService:
         hot_fields = {"gain_db", "muted"}
         target_fields = {"dest_ip", "dest_port", "protocol"}
         try:
-            new_cfg = self._cfg.apply_delta(delta)
+            new_cfg = self._cfg.apply_runtime_delta(delta)
         except (TypeError, ValueError) as e:
             logger.error(f"Delta inválido: {e}")
             self._mqtt.publish_event("config_apply_failed", severity="error", details={"error": str(e), "delta": delta})
-            return
-
-        errors = new_cfg.validate()
-        if errors:
-            logger.error(f"Config resultante inválida: {errors}")
-            self._mqtt.publish_event("config_apply_failed", severity="error", details={"errors": errors, "delta": delta})
             return
 
         hot_changes = {k: v for k, v in delta.items() if k in hot_fields}
         cold_changes = {k: v for k, v in delta.items() if k not in hot_fields}
         target_changes = {k: v for k, v in delta.items() if k in target_fields}
 
-        if target_changes and new_cfg.is_push_transport:
+        if target_changes and new_cfg.is_push_transport and new_cfg.has_stream_target:
             self._stream_target_confirmed = True
             logger.info(f"Destino de stream confirmado por MQTT: {target_changes}")
 
@@ -445,11 +440,6 @@ class AudioCaptureService:
 
         self._cfg = new_cfg
         self._mqtt._cfg = new_cfg
-        if self._config_path:
-            self._cfg.save(self._config_path)
-        else:
-            self._cfg.save()
-
         if self._waiting_for_target and self._stream_target_confirmed:
             logger.info("Destino confirmado mientras el servicio estaba en WAITING_TARGET — arrancando pipeline")
             if not self._start_pipeline(trigger="stream_target_confirmed"):
@@ -512,7 +502,7 @@ class AudioCaptureService:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Servicio de captura y streaming de audio binaural (Nexor)")
-    parser.add_argument("--config", "-c", default=None, help="Ruta al fichero de configuración JSON")
+    parser.add_argument("--config", "-c", default=DEFAULT_CONFIG_PATH, help="Ruta al único fichero JSON de configuración")
     parser.add_argument("--simulate", "-s", action="store_true", help="Modo simulación: no requiere hardware ni GStreamer")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Nivel de log")
     args = parser.parse_args()
@@ -520,17 +510,11 @@ def main() -> int:
     logging.getLogger().setLevel(getattr(logging, args.log_level))
 
     config_path = args.config
-    if config_path:
+    try:
         cfg = AudioCaptureConfig.load(config_path)
-    else:
-        cfg = AudioCaptureConfig.load_with_env_overrides()
-
-    node_runtime = NexorNodeRuntimeConfig.load_with_env_overrides()
-    runtime_errors = node_runtime.validate()
-    if runtime_errors:
-        for err in runtime_errors:
-            logger.warning(f"Node runtime inválida: {err}")
-    cfg = cfg.apply_common_overrides(node_runtime.to_audio_overrides())
+    except ValueError as exc:
+        logger.error("No se puede iniciar el servicio: %s", exc)
+        return 2
 
     if args.simulate:
         logger.info("Modo simulación activado")

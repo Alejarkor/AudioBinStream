@@ -1,87 +1,56 @@
-"""
-config.py — Gestión de configuración del servicio de captura y streaming de
-audio binaural.
-
-La configuración del servicio se persistía en JSON (desired config del propio
-servicio), mientras que la configuración común del nodo se cargaba desde un
-fichero general separado. De esa forma podía compartirse la conexión MQTT y la
-identidad del nodo entre varios servicios Nexor.
-
-Variables de entorno reconocidas (sobreescriben el JSON del servicio):
-    AUDIO_CAPTURE_CONFIG, AUDIO_DEST_IP, AUDIO_DEST_PORT,
-    STREAM_BIND_IP, STREAM_PORT, RODE_MODE
-
-Variables de entorno del nodo común (normalmente definidas en otro fichero):
-    NODE_ID, MQTT_NAMESPACE, MQTT_BROKER, MQTT_PORT, MQTT_USER,
-    MQTT_PASSWORD, NEXOR_ADVERTISE_HOST
-"""
+"""Configuración única y validada del servicio Audio Binaural."""
 
 from __future__ import annotations
 
+import ipaddress
 import json
-import logging
 import os
-from dataclasses import dataclass, asdict
-from typing import Optional
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
 
-logger = logging.getLogger(__name__)
-
-DEFAULT_CONFIG_PATH = os.environ.get(
-    "AUDIO_CAPTURE_CONFIG",
-    "/etc/nexor/audio_capture.json"
-)
-
-PUBLIC_REPORTED_CONFIG_EXCLUDE_KEYS = {
-    "mqtt_user",
-    "mqtt_password",
+DEFAULT_CONFIG_PATH = "/etc/nexor/audio-binaural.json"
+PUBLIC_REPORTED_CONFIG_EXCLUDE_KEYS = {"mqtt_user", "mqtt_password"}
+RUNTIME_FIELDS = {
+    "protocol", "dest_ip", "dest_port", "sample_rate", "channels",
+    "bit_depth", "gain_db", "muted", "rode_mode",
 }
 
 
-@dataclass
+@dataclass(frozen=True)
 class AudioCaptureConfig:
-    # ── Transporte / streaming ────────────────────────────────────────────────
-    # raw_udp    → PCM en bruto sobre UDP hacia un destino configurado.
-    # rtp        → RTP sobre UDP hacia un destino configurado.
-    # tcp_server → compatibilidad opcional. No era el modo preferido.
-    protocol: str = "raw_udp"
+    """Configuración estática; MQTT solo altera campos operativos en memoria."""
 
-    # Para protocolos de tipo push (raw_udp / rtp)
-    dest_ip: str = "192.168.0.20"
-    dest_port: int = 1234
-
-    # Para protocolo servidor (tcp_server)
-    stream_bind_ip: str = "0.0.0.0"
-    stream_port: int = 5004
-
-    # ── Audio ─────────────────────────────────────────────────────────────────
-    sample_rate: int = 48000
-    channels: int = 2
-    bit_depth: int = 24
-    gain_db: float = 0.0
-    muted: bool = False
-
-    # ── Dispositivo ───────────────────────────────────────────────────────────
-    device_name: str = "AI-Micro"
-    alsa_device_override: Optional[str] = None
-
-    # ── RODE AI-Micro ─────────────────────────────────────────────────────────
-    rode_mode: str = "SPLIT"
-    rode_auto_set_mode: bool = True
-
-    # ── Configuración común heredada del nodo ────────────────────────────────
+    schema_version: int = 1
+    node_id: str = "nexor-01"
+    mqtt_namespace: str = "nexor/v1"
     mqtt_broker: str = "127.0.0.1"
     mqtt_port: int = 1883
     mqtt_user: str = ""
     mqtt_password: str = ""
     mqtt_keepalive: int = 60
-    mqtt_reconnect_delay: int = 5
-    node_id: str = "nexor-01"
-    mqtt_namespace: str = "nexor/v1"
-    advertise_host: str = "127.0.0.1"
-
-    # ── Pipeline ──────────────────────────────────────────────────────────────
-    alsa_buffer_time_us: int = 5000
-    pipeline_queue_ms: int = 5
+    mqtt_reconnect_min_seconds: int = 2
+    mqtt_reconnect_max_seconds: int = 60
+    mqtt_tls_enabled: bool = False
+    mqtt_tls_ca_file: str | None = None
+    advertise_host: str = ""
+    protocol: str = "raw_udp"
+    dest_ip: str = ""
+    dest_port: int = 0
+    stream_bind_ip: str = "0.0.0.0"
+    stream_port: int = 5004
+    wait_for_mqtt_target: bool = True
+    sample_rate: int = 48000
+    channels: int = 2
+    bit_depth: int = 24
+    gain_db: float = 0.0
+    muted: bool = False
+    device_name: str = "AI-Micro"
+    alsa_device_override: str | None = None
+    rode_mode: str = "SPLIT"
+    rode_auto_set_mode: bool = True
+    alsa_buffer_time_us: int = 10000
+    pipeline_queue_ms: int = 10
+    heartbeat_seconds: int = 5
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -93,99 +62,85 @@ class AudioCaptureConfig:
         return data
 
     @classmethod
-    def from_dict(cls, d: dict) -> "AudioCaptureConfig":
-        known = set(cls.__dataclass_fields__.keys())
-        return cls(**{k: v for k, v in d.items() if k in known})
+    def from_dict(cls, data: dict) -> "AudioCaptureConfig":
+        known = set(cls.__dataclass_fields__)
+        return cls(**{key: value for key, value in data.items() if key in known})
+
+    @classmethod
+    def load(cls, path: str) -> "AudioCaptureConfig":
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise ValueError(f"No existe el archivo de configuración: {path}") from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"JSON inválido en {path}: {exc}") from exc
+        cfg = cls.from_dict(data).with_shared_mqtt_environment()
+        errors = cfg.validate(allow_missing_target=True)
+        if errors:
+            raise ValueError("Configuración inválida: " + "; ".join(errors))
+        return cfg
+
+    def with_shared_mqtt_environment(self) -> "AudioCaptureConfig":
+        """Obtiene la conexión MQTT únicamente de /etc/nexor/mqtt.env."""
+        def required(name: str) -> str:
+            value = os.environ.get(name, "").strip()
+            if not value:
+                raise ValueError(f"Falta {name} en /etc/nexor/mqtt.env")
+            return value
+
+        def optional_int(name: str, default: int) -> int:
+            value = os.environ.get(name)
+            return default if value in (None, "") else int(value)
+
+        def optional_bool(name: str, default: bool) -> bool:
+            value = os.environ.get(name)
+            if value in (None, ""):
+                return default
+            if value.lower() in {"1", "true", "yes"}:
+                return True
+            if value.lower() in {"0", "false", "no"}:
+                return False
+            raise ValueError(f"{name} debe ser true o false")
+
+        try:
+            return replace(
+                self,
+                node_id=required("NEXOR_NODE_ID"),
+                mqtt_namespace=required("NEXOR_MQTT_NAMESPACE"),
+                mqtt_broker=required("NEXOR_MQTT_HOST"),
+                mqtt_port=int(required("NEXOR_MQTT_PORT")),
+                mqtt_user=os.environ.get("NEXOR_MQTT_USERNAME", ""),
+                mqtt_password=os.environ.get("NEXOR_MQTT_PASSWORD", ""),
+                mqtt_keepalive=optional_int("NEXOR_MQTT_KEEPALIVE_SECONDS", self.mqtt_keepalive),
+                mqtt_reconnect_min_seconds=optional_int("NEXOR_MQTT_RECONNECT_MIN_SECONDS", self.mqtt_reconnect_min_seconds),
+                mqtt_reconnect_max_seconds=optional_int("NEXOR_MQTT_RECONNECT_MAX_SECONDS", self.mqtt_reconnect_max_seconds),
+                mqtt_tls_enabled=optional_bool("NEXOR_MQTT_TLS_ENABLED", self.mqtt_tls_enabled),
+                mqtt_tls_ca_file=os.environ.get("NEXOR_MQTT_TLS_CA_FILE") or None,
+            )
+        except ValueError as exc:
+            raise ValueError(f"Configuración MQTT compartida inválida: {exc}") from exc
 
     @staticmethod
     def normalize_rode_mode(value: str) -> str:
         if not isinstance(value, str):
-            raise ValueError("rode_mode debe ser string")
-        norm = value.strip().lower()
-        mapping = {
-            "split": "SPLIT",
-            "merged": "MERGED",
-            "merge": "MERGED",
-            "stereo": "STEREO",
-        }
-        if norm not in mapping:
-            raise ValueError(f"rode_mode inválido: {value}")
-        return mapping[norm]
+            raise ValueError("rode_mode debe ser texto")
+        modes = {"split": "SPLIT", "merged": "MERGED", "merge": "MERGED", "stereo": "STEREO"}
+        try:
+            return modes[value.strip().lower()]
+        except KeyError as exc:
+            raise ValueError(f"rode_mode inválido: {value}") from exc
 
     @property
     def mqtt_rode_mode(self) -> str:
-        return {
-            "SPLIT": "split",
-            "MERGED": "merged",
-            "STEREO": "stereo",
-        }.get(self.rode_mode.upper(), self.rode_mode.lower())
+        return self.normalize_rode_mode(self.rode_mode).lower()
 
     @property
     def is_push_transport(self) -> bool:
-        return self.protocol in ("raw_udp", "rtp")
+        return self.protocol in {"raw_udp", "rtp"}
 
-    def apply_delta(self, delta: dict) -> "AudioCaptureConfig":
-        current = self.to_dict()
-        merged = dict(current)
-        merged.update(delta)
-        if "rode_mode" in merged:
-            merged["rode_mode"] = self.normalize_rode_mode(merged["rode_mode"])
-        return self.from_dict(merged)
-
-    def apply_common_overrides(self, overrides: dict) -> "AudioCaptureConfig":
-        return self.apply_delta(overrides)
-
-    def save(self, path: str = DEFAULT_CONFIG_PATH) -> None:
-        path = path or DEFAULT_CONFIG_PATH
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.to_dict(), f, indent=2)
-            os.replace(tmp, path)
-            logger.info(f"Config guardada en {path}")
-        except OSError as e:
-            logger.error(f"Error guardando config en {path}: {e}")
-
-    @classmethod
-    def load(cls, path: str = DEFAULT_CONFIG_PATH) -> "AudioCaptureConfig":
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            cfg = cls.from_dict(data)
-            if cfg.rode_mode:
-                cfg.rode_mode = cls.normalize_rode_mode(cfg.rode_mode)
-            logger.info(f"Config cargada desde {path}")
-            return cfg
-        except FileNotFoundError:
-            logger.info(f"Config no encontrada en {path} — usando valores por defecto")
-            return cls()
-        except (json.JSONDecodeError, TypeError, ValueError) as e:
-            logger.warning(f"Error parseando config en {path}: {e} — usando valores por defecto")
-            return cls()
-
-    @classmethod
-    def load_with_env_overrides(cls, path: str = DEFAULT_CONFIG_PATH) -> "AudioCaptureConfig":
-        cfg = cls.load(path)
-        env_map = {
-            "AUDIO_DEST_IP": ("dest_ip", str),
-            "AUDIO_DEST_PORT": ("dest_port", int),
-            "STREAM_BIND_IP": ("stream_bind_ip", str),
-            "STREAM_PORT": ("stream_port", int),
-            "RODE_MODE": ("rode_mode", cls.normalize_rode_mode),
-        }
-        delta = {}
-        for env_key, (field_name, cast) in env_map.items():
-            val = os.environ.get(env_key)
-            if val is None:
-                continue
-            try:
-                delta[field_name] = cast(val)
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Variable de entorno {env_key}={val!r} inválida: {e}")
-        if delta:
-            cfg = cfg.apply_delta(delta)
-        return cfg
+    @property
+    def has_stream_target(self) -> bool:
+        return bool(self.dest_ip) and 1 <= self.dest_port <= 65535
 
     @property
     def gain_linear(self) -> float:
@@ -205,7 +160,7 @@ class AudioCaptureConfig:
 
     @property
     def mqtt_base_topic(self) -> str:
-        return f"{self.mqtt_node_base_topic}/services/audio_binaural"
+        return f"{self.mqtt_node_base_topic}/services/audio_binaural_streaming"
 
     @property
     def mqtt_cmd_topic(self) -> str:
@@ -245,44 +200,68 @@ class AudioCaptureConfig:
 
     @property
     def effective_stream_host(self) -> str:
-        if self.protocol == "tcp_server":
-            return self.advertise_host
-        return self.dest_ip
+        return self.advertise_host if self.protocol == "tcp_server" else self.dest_ip
 
     @property
     def effective_stream_port(self) -> int:
-        if self.protocol == "tcp_server":
-            return self.stream_port
-        return self.dest_port
+        return self.stream_port if self.protocol == "tcp_server" else self.dest_port
 
-    def validate(self) -> list[str]:
+    def apply_runtime_delta(self, delta: dict) -> "AudioCaptureConfig":
+        unknown = set(delta) - RUNTIME_FIELDS
+        if unknown:
+            raise ValueError("Campos no permitidos por MQTT: " + ", ".join(sorted(unknown)))
+        values = self.to_dict()
+        values.update(delta)
+        values["rode_mode"] = self.normalize_rode_mode(values["rode_mode"])
+        cfg = self.from_dict(values)
+        target_changed = bool({"protocol", "dest_ip", "dest_port"} & set(delta))
+        errors = cfg.validate(allow_missing_target=not target_changed)
+        if errors:
+            raise ValueError("Configuración dinámica inválida: " + "; ".join(errors))
+        return cfg
+
+    def validate(self, allow_missing_target: bool = True) -> list[str]:
         errors: list[str] = []
-        if self.bit_depth not in (16, 24):
-            errors.append(f"bit_depth inválido: {self.bit_depth} (válidos: 16, 24)")
-        if self.sample_rate not in (8000, 16000, 32000, 44100, 48000, 96000):
-            errors.append(f"sample_rate inusual: {self.sample_rate}")
-        if self.channels not in (1, 2):
-            errors.append(f"channels inválido: {self.channels} (válidos: 1, 2)")
-        if not (-60.0 <= self.gain_db <= 60.0):
-            errors.append(f"gain_db fuera de rango: {self.gain_db}")
-        if self.protocol not in ("rtp", "raw_udp", "tcp_server"):
-            errors.append(f"protocol inválido: {self.protocol}")
+        if self.schema_version != 1:
+            errors.append("schema_version no soportada")
+        if not self.node_id or not self.mqtt_namespace or not self.mqtt_broker:
+            errors.append("node_id, mqtt_namespace y mqtt_broker son obligatorios")
+        if any(char.isspace() for char in self.mqtt_broker) or "#" in self.mqtt_broker:
+            errors.append("mqtt_broker no puede contener espacios ni comentarios")
+        if not 1 <= int(self.mqtt_port) <= 65535:
+            errors.append("mqtt_port inválido")
+        if not 1 <= int(self.mqtt_keepalive) <= 3600:
+            errors.append("mqtt_keepalive inválido")
+        if not 1 <= self.mqtt_reconnect_min_seconds <= self.mqtt_reconnect_max_seconds <= 3600:
+            errors.append("backoff MQTT inválido")
+        if self.protocol not in {"raw_udp", "rtp", "tcp_server"}:
+            errors.append("protocol inválido")
+        if self.sample_rate not in {8000, 16000, 32000, 44100, 48000, 96000}:
+            errors.append("sample_rate inválido")
+        if self.channels not in {1, 2} or self.bit_depth not in {16, 24}:
+            errors.append("channels o bit_depth inválidos")
+        if not -20.0 <= float(self.gain_db) <= 20.0:
+            errors.append("gain_db fuera de rango")
+        if not 1000 <= int(self.alsa_buffer_time_us) <= 500000:
+            errors.append("alsa_buffer_time_us fuera de rango")
+        if not 1 <= int(self.pipeline_queue_ms) <= 1000:
+            errors.append("pipeline_queue_ms fuera de rango")
         try:
             self.normalize_rode_mode(self.rode_mode)
-        except ValueError as e:
-            errors.append(str(e))
+        except ValueError as exc:
+            errors.append(str(exc))
         if self.protocol == "tcp_server":
-            if not (1 <= self.stream_port <= 65535):
-                errors.append(f"stream_port inválido: {self.stream_port}")
-            if not self.stream_bind_ip:
-                errors.append("stream_bind_ip vacío")
-        else:
-            if not self.dest_ip:
-                errors.append("dest_ip vacío")
-            if not (1 <= self.dest_port <= 65535):
-                errors.append(f"dest_port inválido: {self.dest_port}")
-        if not self.node_id:
-            errors.append("node_id vacío")
-        if not self.mqtt_namespace:
-            errors.append("mqtt_namespace vacío")
+            if not _is_ip(self.stream_bind_ip) or not 1 <= int(self.stream_port) <= 65535:
+                errors.append("stream_bind_ip o stream_port inválidos")
+        elif not (allow_missing_target and not self.dest_ip and self.dest_port == 0):
+            if not _is_ip(self.dest_ip) or not 1 <= int(self.dest_port) <= 65535:
+                errors.append("dest_ip o dest_port inválidos")
         return errors
+
+
+def _is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import threading
 import time
 from datetime import datetime, timezone
@@ -18,17 +19,14 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-SERVICE_NAME = "audio_binaural"
+SERVICE_NAME = "audio_binaural_streaming"
 PUSH_TRANSPORTS = {"raw_udp", "rtp"}
 
 CAPABILITIES = {
     "service": SERVICE_NAME,
     "actions": [
-        "start",
         "resume",
         "standby",
-        "stop",
-        "restart",
         "mute",
         "unmute",
         "get_state",
@@ -38,8 +36,6 @@ CAPABILITIES = {
         "protocol": {"type": "enum", "values": ["raw_udp", "rtp"]},
         "dest_ip": {"type": "string"},
         "dest_port": {"type": "integer", "min": 1, "max": 65535},
-        "stream_bind_ip": {"type": "string"},
-        "stream_port": {"type": "integer", "min": 1, "max": 65535},
         "sample_rate": {"type": "enum", "values": [44100, 48000]},
         "channels": {"type": "integer", "min": 1, "max": 2},
         "bit_depth": {"type": "enum", "values": [16, 24]},
@@ -74,6 +70,7 @@ class AudioCaptureServiceAdapter:
         self._connected = False
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
+        self._pending: queue.SimpleQueue[tuple[str, dict]] = queue.SimpleQueue()
         self._on_start = on_start or (lambda: None)
         self._on_resume = on_resume or self._on_start
         self._on_standby = on_standby or (lambda: None)
@@ -111,16 +108,13 @@ class AudioCaptureServiceAdapter:
         client.on_message = self._on_message
         self._client = client
 
-        try:
-            client.connect(cfg.mqtt_broker, cfg.mqtt_port, cfg.mqtt_keepalive)
-        except (OSError, ConnectionRefusedError) as e:
-            logger.error(f"No se puede conectar al broker MQTT {cfg.mqtt_broker}:{cfg.mqtt_port}: {e}")
-            self._client = None
-            return False
-        except Exception as e:
-            logger.error(f"Error MQTT inesperado: {e}")
-            self._client = None
-            return False
+        if cfg.mqtt_tls_enabled:
+            client.tls_set(ca_certs=cfg.mqtt_tls_ca_file or None)
+        client.reconnect_delay_set(
+            min_delay=cfg.mqtt_reconnect_min_seconds,
+            max_delay=cfg.mqtt_reconnect_max_seconds,
+        )
+        client.connect_async(cfg.mqtt_broker, cfg.mqtt_port, cfg.mqtt_keepalive)
 
         client.loop_start()
         logger.info(f"MQTT adapter iniciado → {cfg.mqtt_broker}:{cfg.mqtt_port}")
@@ -140,6 +134,20 @@ class AudioCaptureServiceAdapter:
 
     def is_connected(self) -> bool:
         return self._connected
+
+    def process_pending(self) -> None:
+        """Ejecuta en el hilo principal las órdenes recibidas por MQTT."""
+        while True:
+            try:
+                topic, payload = self._pending.get_nowait()
+            except queue.Empty:
+                return
+            if topic == self._cfg.mqtt_cmd_topic:
+                self._handle_command(payload)
+            elif topic == self._cfg.mqtt_config_desired_topic:
+                self._handle_desired_config(payload)
+            elif topic == self._cfg.mqtt_stream_target_desired_topic:
+                self._handle_stream_target_desired(payload)
 
     def publish_state(self, status: str, healthy: bool = True,
                       pid: Optional[int] = None, uptime_s: Optional[int] = None,
@@ -233,7 +241,7 @@ class AudioCaptureServiceAdapter:
     def _on_disconnect(self, client, userdata, rc) -> None:
         self._connected = False
         if rc != 0 and not self._stop_event.is_set():
-            logger.warning(f"MQTT desconectado inesperadamente (rc={rc}). Reconectando en {self._cfg.mqtt_reconnect_delay}s...")
+            logger.warning("MQTT desconectado inesperadamente (rc=%s); reintentará conectar", rc)
         else:
             logger.info("MQTT desconectado")
 
@@ -245,14 +253,14 @@ class AudioCaptureServiceAdapter:
             logger.warning(f"Mensaje MQTT malformado en {topic}: {e}")
             return
 
-        if topic == self._cfg.mqtt_cmd_topic:
-            self._handle_command(payload)
-        elif topic == self._cfg.mqtt_config_desired_topic:
-            self._handle_desired_config(payload)
-        elif topic == self._cfg.mqtt_stream_target_desired_topic:
-            self._handle_stream_target_desired(payload)
-        else:
+        if topic not in {
+            self._cfg.mqtt_cmd_topic,
+            self._cfg.mqtt_config_desired_topic,
+            self._cfg.mqtt_stream_target_desired_topic,
+        }:
             logger.debug(f"Mensaje en topic no manejado: {topic}")
+            return
+        self._pending.put((topic, payload))
 
     def _handle_command(self, payload: dict) -> None:
         action = payload.get("action", "").lower()
@@ -262,11 +270,8 @@ class AudioCaptureServiceAdapter:
         logger.info(f"Comando recibido: action={action} source={source} msg_id={msg_id}")
 
         handlers = {
-            "start": self._cmd_start,
             "resume": self._cmd_resume,
             "standby": self._cmd_standby,
-            "stop": self._cmd_stop,
-            "restart": self._cmd_restart,
             "mute": self._cmd_mute,
             "unmute": self._cmd_unmute,
             "get_state": self._cmd_get_state,

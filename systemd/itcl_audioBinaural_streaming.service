@@ -1,0 +1,31 @@
+[Unit]
+Description=ITCL Audio Binaural Streaming
+Documentation=file:///opt/nexor/audio-binaural/README.md
+Wants=network-online.target
+After=network-online.target sound.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=nexor
+Group=nexor
+SupplementaryGroups=audio
+WorkingDirectory=/opt/nexor/audio-binaural
+ExecStart=/opt/nexor/audio-binaural/venv/bin/python -m audio_capture_service.main --config /etc/nexor/audio-binaural.json --log-level INFO
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/nexor/mqtt.env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=itcl-audioBinaural-streaming
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
+Alias=audio-capture.service audio_binaural.service

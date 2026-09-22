@@ -90,12 +90,12 @@ class TestConfig(unittest.TestCase):
     def test_validate_bad_port(self):
         cfg = self.Config(protocol="raw_udp", dest_port=99999)
         errors = cfg.validate()
-        self.assertTrue(any("dest_port" in e for e in errors))
+        self.assertTrue(any("dest_ip o dest_port" in e for e in errors))
         print(f"  ✓ Validación detecta dest_port inválido")
 
-    def test_apply_delta(self):
+    def test_apply_runtime_delta(self):
         cfg = self.Config()
-        new_cfg = cfg.apply_delta({"gain_db": 3.0, "muted": True, "sample_rate": 44100})
+        new_cfg = cfg.apply_runtime_delta({"gain_db": 3.0, "muted": True, "sample_rate": 44100})
         self.assertEqual(new_cfg.gain_db, 3.0)
         self.assertTrue(new_cfg.muted)
         self.assertEqual(new_cfg.sample_rate, 44100)
@@ -103,46 +103,32 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg.gain_db, 0.0)
         print(f"  ✓ apply_delta funciona correctamente")
 
-    def test_apply_delta_ignores_unknown_keys(self):
+    def test_apply_runtime_delta_rejects_static_keys(self):
         cfg = self.Config()
-        new_cfg = cfg.apply_delta({"clave_desconocida": 999, "gain_db": 1.0})
-        self.assertEqual(new_cfg.gain_db, 1.0)
-        self.assertFalse(hasattr(new_cfg, "clave_desconocida"))
-        print(f"  ✓ apply_delta ignora claves desconocidas")
+        with self.assertRaises(ValueError):
+            cfg.apply_runtime_delta({"mqtt_password": "no-permitido"})
+        print(f"  ✓ MQTT no puede alterar campos estáticos")
 
-    def test_save_and_load(self):
-        cfg = self.Config(
-            dest_ip="10.0.0.5",
-            dest_port=1234,
-            gain_db=6.0,
-            node_id="nexor-test"
-        )
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            tmp_path = f.name
-        try:
-            cfg.save(tmp_path)
-            loaded = self.Config.load(tmp_path)
-            self.assertEqual(loaded.dest_ip, "10.0.0.5")
-            self.assertEqual(loaded.dest_port, 1234)
-            self.assertAlmostEqual(loaded.gain_db, 6.0)
-            self.assertEqual(loaded.node_id, "nexor-test")
-            print(f"  ✓ save/load JSON funciona correctamente")
-        finally:
-            os.unlink(tmp_path)
+    def test_report_excludes_credentials(self):
+        cfg = self.Config(mqtt_user="u", mqtt_password="p")
+        report = cfg.to_report_dict()
+        self.assertNotIn("mqtt_user", report)
+        self.assertNotIn("mqtt_password", report)
+        print(f"  ✓ Config reportada no expone credenciales")
 
     def test_load_missing_file(self):
-        cfg = self.Config.load("/tmp/no_existe_este_fichero_12345.json")
-        self.assertIsInstance(cfg, self.Config)
-        print(f"  ✓ load() con fichero inexistente devuelve config por defecto")
+        with self.assertRaises(ValueError):
+            self.Config.load("/tmp/no_existe_este_fichero_12345.json")
+        print(f"  ✓ load() exige un archivo de configuración explícito")
 
     def test_load_corrupt_json(self):
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             f.write("{esto no es json válido")
             tmp_path = f.name
         try:
-            cfg = self.Config.load(tmp_path)
-            self.assertIsInstance(cfg, self.Config)
-            print(f"  ✓ load() con JSON corrupto devuelve config por defecto")
+            with self.assertRaises(ValueError):
+                self.Config.load(tmp_path)
+            print(f"  ✓ load() rechaza JSON corrupto")
         finally:
             os.unlink(tmp_path)
 
@@ -162,23 +148,16 @@ class TestConfig(unittest.TestCase):
 
     def test_mqtt_topics(self):
         cfg = self.Config(node_id="nexor-42")
-        self.assertEqual(cfg.mqtt_cmd_topic,    "nexor/v1/nodes/nexor-42/services/audio_binaural/cmd")
-        self.assertEqual(cfg.mqtt_state_topic,  "nexor/v1/nodes/nexor-42/services/audio_binaural/state")
-        self.assertEqual(cfg.mqtt_config_desired_topic, "nexor/v1/nodes/nexor-42/services/audio_binaural/config/desired")
+        self.assertEqual(cfg.mqtt_cmd_topic,    "nexor/v1/nodes/nexor-42/services/audio_binaural_streaming/cmd")
+        self.assertEqual(cfg.mqtt_state_topic,  "nexor/v1/nodes/nexor-42/services/audio_binaural_streaming/state")
+        self.assertEqual(cfg.mqtt_config_desired_topic, "nexor/v1/nodes/nexor-42/services/audio_binaural_streaming/config/desired")
         print(f"  ✓ Topics MQTT generados correctamente")
 
-    def test_env_overrides(self):
-        os.environ["AUDIO_DEST_PORT"] = "9999"
-        try:
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-                json.dump({}, f)
-                tmp_path = f.name
-            cfg = self.Config.load_with_env_overrides(tmp_path)
-            self.assertEqual(cfg.dest_port, 9999)
-            print(f"  ✓ Variables de entorno sobreescriben config correctamente")
-        finally:
-            os.environ.pop("AUDIO_DEST_PORT", None)
-            os.unlink(tmp_path)
+    def test_invalid_stream_target_is_rejected(self):
+        cfg = self.Config()
+        with self.assertRaises(ValueError):
+            cfg.apply_runtime_delta({"dest_ip": "not-an-ip", "dest_port": 1234})
+        print(f"  ✓ El destino MQTT se valida antes de crear el pipeline")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -363,18 +342,14 @@ class TestMqttAdapter(unittest.TestCase):
         called = {}
         adapter = AudioCaptureServiceAdapter(
             cfg,
-            on_start=lambda: called.__setitem__("start", True),
-            on_stop=lambda: called.__setitem__("stop", True),
+            on_resume=lambda: called.__setitem__("resume", True),
             on_mute=lambda m: called.__setitem__("mute", m),
             on_apply_config=lambda d: called.__setitem__("apply_config", d),
         )
 
         # Simular mensajes MQTT directamente
-        adapter._handle_command({"action": "start", "msg_id": "t1", "source": "test", "params": {}})
-        self.assertTrue(called.get("start"))
-
-        adapter._handle_command({"action": "stop", "msg_id": "t2", "source": "test", "params": {}})
-        self.assertTrue(called.get("stop"))
+        adapter._handle_command({"action": "resume", "msg_id": "t1", "source": "test", "params": {}})
+        self.assertTrue(called.get("resume"))
 
         adapter._handle_command({"action": "mute", "msg_id": "t3", "source": "test", "params": {}})
         self.assertTrue(called.get("mute"))
@@ -433,6 +408,7 @@ class TestSimulationMode(unittest.TestCase):
             node_id="test-sim",
             mqtt_broker="127.0.0.1",  # no conectará — OK en simulación
             dest_ip="127.0.0.1",
+            dest_port=1234,
         )
         service = AudioCaptureService(cfg, simulate=True)
 

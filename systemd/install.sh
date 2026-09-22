@@ -1,87 +1,60 @@
-#!/bin/bash
-# install.sh — Instala el servicio de captura de audio en la Jetson Orin
-# Ejecutar como root: sudo bash install.sh
+#!/usr/bin/env bash
+set -euo pipefail
 
-set -e
+service_user="nexor"
+install_dir="/opt/nexor/audio-binaural"
+config_dir="/etc/nexor"
+config_file="$config_dir/audio-binaural.json"
+unit_name="itcl_audioBinaural_streaming.service"
+legacy_unit="audio-capture.service"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-INSTALL_DIR="/opt/nexor/audio_capture_service"
-CONFIG_DIR="/etc/nexor"
-SERVICE_NAME="audio-capture"
-USER="nexor"
-
-echo "=== Instalando Audio Capture Service ==="
-
-# ── 1. Crear usuario del servicio (si no existe) ──────────────────────────
-if ! id "$USER" &>/dev/null; then
-    useradd -r -s /usr/sbin/nologin -G audio "$USER"
-    echo "Usuario '$USER' creado"
-else
-    # Asegurar que está en el grupo audio
-    usermod -aG audio "$USER"
-    echo "Usuario '$USER' ya existe — añadido a grupo audio"
+if [[ $EUID -ne 0 ]]; then
+  echo "Ejecuta como root: sudo bash systemd/install.sh" >&2
+  exit 1
 fi
 
-# ── 2. Dependencias del sistema ───────────────────────────────────────────
-echo "Instalando dependencias del sistema..."
-apt-get update -qq
-apt-get install -y \
-    python3-gi \
-    python3-gst-1.0 \
-    gstreamer1.0-alsa \
-    gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-base \
-    alsa-utils \
-    python3-usb \
-    python3-pip
-
-# ── 3. Dependencias Python ────────────────────────────────────────────────
-echo "Instalando dependencias Python..."
-pip3 install --break-system-packages paho-mqtt
-
-# ── 4. Instalar el servicio ───────────────────────────────────────────────
-echo "Copiando ficheros del servicio..."
-mkdir -p "$INSTALL_DIR"
-cp -r "$(dirname "$0")/../audio_capture_service/"* "$INSTALL_DIR/"
-chown -R "$USER:$USER" "$INSTALL_DIR"
-
-# ── 5. Crear directorio de configuración ──────────────────────────────────
-mkdir -p "$CONFIG_DIR"
-chown root:nexor "$CONFIG_DIR"
-chmod 750 "$CONFIG_DIR"
-
-# ── 6. Crear fichero de env si no existe ──────────────────────────────────
-ENV_FILE="$CONFIG_DIR/audio_capture.env"
-if [ ! -f "$ENV_FILE" ]; then
-    cat > "$ENV_FILE" << 'EOF'
-# Variables de entorno para el servicio de captura de audio
-# EDITAR antes de arrancar el servicio
-
-MQTT_BROKER=192.168.1.100
-MQTT_PORT=1883
-MQTT_USER=nexor_audio_in
-MQTT_PASSWORD=CAMBIAR_ESTO
-NODE_ID=nexor-01
-AUDIO_DEST_IP=192.168.0.20
-AUDIO_DEST_PORT=5004
-EOF
-    chmod 640 "$ENV_FILE"
-    chown root:nexor "$ENV_FILE"
-    echo "Fichero de env creado en $ENV_FILE — EDÍTALO antes de arrancar"
+if ! id "$service_user" >/dev/null 2>&1; then
+  useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin --groups audio "$service_user"
 else
-    echo "Fichero de env ya existe: $ENV_FILE"
+  usermod -aG audio "$service_user"
 fi
 
-# ── 7. Instalar unidad systemd ────────────────────────────────────────────
-echo "Instalando unidad systemd..."
-cp "$(dirname "$0")/audio-capture.service" /etc/systemd/system/
+install -d -o root -g root -m 0755 /opt/nexor
+install -d -o "$service_user" -g audio -m 0755 "$install_dir"
+rsync -a --delete \
+  --exclude '__pycache__' \
+  --exclude '*.pyc' \
+  --exclude '.git' \
+  "$repo_root/audio_capture_service/" "$install_dir/audio_capture_service/"
+install -m 0644 "$repo_root/README.md" "$install_dir/README.md"
+
+if [[ ! -x "$install_dir/venv/bin/python" ]]; then
+  python3 -m venv --system-site-packages "$install_dir/venv"
+fi
+if ! "$install_dir/venv/bin/python" -c 'import paho.mqtt.client, usb.core' 2>/dev/null; then
+  "$install_dir/venv/bin/pip" install -r "$repo_root/requirements.txt"
+fi
+
+install -d -o root -g "$service_user" -m 0750 "$config_dir"
+if [[ ! -f "$config_file" ]]; then
+  install -o root -g "$service_user" -m 0640 \
+    "$repo_root/config/audio-binaural.example.json" "$config_file"
+  echo "Creado $config_file. Completa la configuración de audio antes de arrancar."
+else
+  chown root:"$service_user" "$config_file"
+  chmod 0640 "$config_file"
+fi
+
+install -o root -g root -m 0644 "$repo_root/systemd/itcl_audioBinaural_streaming.service" \
+  "/etc/systemd/system/$unit_name"
+if systemctl cat "$legacy_unit" >/dev/null 2>&1; then
+  systemctl disable "$legacy_unit" || true
+  rm -f "/etc/systemd/system/$legacy_unit"
+fi
 systemctl daemon-reload
-systemctl enable "$SERVICE_NAME"
+systemctl enable "$unit_name"
+systemd-analyze verify "/etc/systemd/system/$unit_name"
 
-echo ""
-echo "=== Instalación completada ==="
-echo ""
-echo "Pasos siguientes:"
-echo "  1. Edita $ENV_FILE con las credenciales MQTT correctas"
-echo "  2. sudo systemctl start $SERVICE_NAME"
-echo "  3. sudo journalctl -u $SERVICE_NAME -f"
-echo ""
+echo "Instalación terminada. Revisa $config_file y arranca con:"
+echo "  sudo systemctl start $unit_name"

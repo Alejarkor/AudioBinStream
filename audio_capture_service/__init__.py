@@ -1,2 +1,3 @@
-"""Audio Capture Service — Nexor Binaural Audio System."""
-__version__ = "1.0.0"
+"""Servicio Audio Binaural para nodos Nexor."""
+
+__version__ = "2.0.0"

@@ -25,12 +25,18 @@ class PipelineState:
 
 
 class AudioPipeline:
+    _FIRST_BUFFER_TIMEOUT_SECONDS = 4.0
+
     def __init__(self,
                  on_state_change: Optional[Callable[[str], None]] = None,
                  on_error: Optional[Callable[[str], None]] = None) -> None:
         self._pipeline = None
         self._loop = None
         self._loop_thread = None
+        self._bus = None
+        self._bus_handler_id = None
+        self._first_buffer_event = None
+        self._generation = 0
         self._state = PipelineState.STOPPED
         self._vol_element = None
         self._lock = threading.Lock()
@@ -42,8 +48,13 @@ class AudioPipeline:
         return self._state
 
     def start(self, cfg) -> bool:
+        # Un error del bus conserva la instancia para que el hilo principal la
+        # pueda desmontar. No permitimos crear encima un segundo pipeline.
+        if self.state == PipelineState.ERROR:
+            self.stop()
+
         with self._lock:
-            if self._state not in (PipelineState.STOPPED, PipelineState.ERROR):
+            if self._state != PipelineState.STOPPED:
                 logger.warning(f"start() ignorado — estado actual: {self._state}")
                 return False
 
@@ -72,27 +83,51 @@ class AudioPipeline:
         vol = pipeline.get_by_name("vol")
         if vol is None:
             logger.warning("Elemento 'vol' no encontrado en el pipeline")
+        first_buffer = pipeline.get_by_name("first_buffer")
+        if first_buffer is None:
+            logger.error("Elemento de verificación 'first_buffer' no encontrado")
+            pipeline.set_state(Gst.State.NULL)
+            self._set_state(PipelineState.ERROR)
+            return False
 
+        first_buffer_event = threading.Event()
+        loop = GLib.MainLoop()
+        with self._lock:
+            self._generation += 1
+            generation = self._generation
+            self._pipeline = pipeline
+            self._vol_element = vol
+            self._loop = loop
+            self._first_buffer_event = first_buffer_event
+
+        first_buffer.connect("handoff", lambda *_: self._on_first_buffer(generation))
         bus = pipeline.get_bus()
         bus.add_signal_watch()
-        bus.connect("message", self._on_bus_message)
+        handler_id = bus.connect("message", lambda bus_, message: self._on_bus_message(generation, bus_, message))
+        with self._lock:
+            self._bus = bus
+            self._bus_handler_id = handler_id
+
+        loop_thread = threading.Thread(target=loop.run, name="gst-mainloop", daemon=True)
+        with self._lock:
+            self._loop_thread = loop_thread
+        loop_thread.start()
 
         ret = pipeline.set_state(Gst.State.PLAYING)
         from gi.repository import Gst as GstLocal
         if ret == GstLocal.StateChangeReturn.FAILURE:
             logger.error("Pipeline no pudo arrancar (set_state PLAYING falló)")
-            pipeline.set_state(GstLocal.State.NULL)
+            self.stop()
             self._set_state(PipelineState.ERROR)
             return False
 
-        with self._lock:
-            self._pipeline = pipeline
-            self._vol_element = vol
-
-        loop = GLib.MainLoop()
-        self._loop = loop
-        self._loop_thread = threading.Thread(target=loop.run, name="gst-mainloop", daemon=True)
-        self._loop_thread.start()
+        if not first_buffer_event.wait(timeout=self._FIRST_BUFFER_TIMEOUT_SECONDS):
+            msg = "Pipeline no entregó ningún buffer de audio dentro del tiempo límite"
+            logger.error(msg)
+            self._on_error(msg)
+            self.stop()
+            self._set_state(PipelineState.ERROR)
+            return False
 
         self._set_state(PipelineState.RUNNING)
         logger.info(
@@ -103,10 +138,23 @@ class AudioPipeline:
 
     def stop(self) -> None:
         with self._lock:
-            if self._state in (PipelineState.STOPPED,):
+            if self._state == PipelineState.STOPPED and self._pipeline is None:
                 return
             pipeline = self._pipeline
             loop = self._loop
+            loop_thread = self._loop_thread
+            bus = self._bus
+            bus_handler_id = self._bus_handler_id
+            # Invalida mensajes del bus que pertenezcan a esta instancia antes
+            # de pasarla a NULL.
+            self._generation += 1
+            self._pipeline = None
+            self._vol_element = None
+            self._loop = None
+            self._loop_thread = None
+            self._bus = None
+            self._bus_handler_id = None
+            self._first_buffer_event = None
 
         self._set_state(PipelineState.STOPPING)
 
@@ -119,17 +167,20 @@ class AudioPipeline:
         except Exception as e:
             logger.warning(f"Error parando pipeline: {e}")
 
+        if bus:
+            try:
+                if bus_handler_id is not None:
+                    bus.disconnect(bus_handler_id)
+                bus.remove_signal_watch()
+            except Exception as e:
+                logger.debug(f"Error liberando bus GStreamer: {e}")
+
         if loop and loop.is_running():
             loop.quit()
 
-        if self._loop_thread and self._loop_thread.is_alive():
-            self._loop_thread.join(timeout=3.0)
-
-        with self._lock:
-            self._pipeline = None
-            self._vol_element = None
-            self._loop = None
-            self._loop_thread = None
+        # Nunca intentar hacer join al hilo GLib desde ese mismo hilo.
+        if loop_thread and loop_thread.is_alive() and loop_thread is not threading.current_thread():
+            loop_thread.join(timeout=3.0)
 
         self._set_state(PipelineState.STOPPED)
         logger.info("Pipeline detenido")
@@ -142,8 +193,9 @@ class AudioPipeline:
     def set_mute(self, muted: bool) -> bool:
         with self._lock:
             vol = self._vol_element
-        if vol is None:
-            logger.warning("set_mute: elemento volume no disponible")
+            state = self._state
+        if vol is None or state not in (PipelineState.RUNNING, PipelineState.PAUSED):
+            logger.warning(f"set_mute ignorado — pipeline no operativo (estado: {state})")
             return False
         vol.set_property("mute", muted)
         self._set_state(PipelineState.PAUSED if muted else PipelineState.RUNNING)
@@ -173,6 +225,7 @@ class AudioPipeline:
         gain_linear = max(0.0, min(cfg.gain_linear, 10.0))
         mute_str = "true" if cfg.muted else "false"
         src = f"alsasrc device={alsa_id} buffer-time={cfg.alsa_buffer_time_us}"
+        readiness = "identity name=first_buffer signal-handoffs=true"
         convert = f"audioconvert ! {caps} ! audioresample"
         volume = f"volume name=vol volume={gain_linear:.4f} mute={mute_str}"
         queue = (
@@ -194,10 +247,21 @@ class AudioPipeline:
                 f"tcpserversink host={cfg.stream_bind_ip} port={cfg.stream_port} sync=false"
             )
 
-        return f"{src} ! {convert} ! {volume} ! {queue} ! {sink}"
+        return f"{src} ! {readiness} ! {convert} ! {volume} ! {queue} ! {sink}"
 
-    def _on_bus_message(self, bus, message) -> None:
+    def _on_first_buffer(self, generation: int) -> None:
+        with self._lock:
+            if generation != self._generation:
+                return
+            event = self._first_buffer_event
+        if event:
+            event.set()
+
+    def _on_bus_message(self, generation: int, bus, message) -> None:
         try:
+            with self._lock:
+                if generation != self._generation:
+                    return
             import gi
             gi.require_version("Gst", "1.0")
             from gi.repository import Gst
@@ -213,7 +277,13 @@ class AudioPipeline:
 
             elif message.type == Gst.MessageType.EOS:
                 logger.info("GStreamer EOS recibido")
-                self.stop()
+                # Estamos en el hilo GLib: llamar stop() aquí intentaría hacer
+                # join sobre sí mismo. El bucle principal hará el teardown.
+                msg = "GStreamer EOS inesperado"
+                self._set_state(PipelineState.ERROR)
+                self._on_error(msg)
+                if self._loop and self._loop.is_running():
+                    self._loop.quit()
 
             elif message.type == Gst.MessageType.WARNING:
                 warn, debug = message.parse_warning()

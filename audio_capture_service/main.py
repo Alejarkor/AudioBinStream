@@ -22,7 +22,11 @@ from dataclasses import replace
 from typing import Optional
 
 from .config import AudioCaptureConfig, DEFAULT_CONFIG_PATH
-from .device_discovery import find_alsa_device_by_name, list_alsa_capture_devices
+from .device_discovery import (
+    find_alsa_device_by_name,
+    list_alsa_capture_devices,
+    wait_for_alsa_capture_device,
+)
 from .pipeline import AudioPipeline, PipelineState
 from .mqtt_adapter import AudioCaptureServiceAdapter
 from .rode_controller import RodeController, RodeControllerError
@@ -49,6 +53,7 @@ class AudioCaptureService:
         self._waiting_for_target = False
         self._stream_target_confirmed = False
         self._idle = False
+        self._reconfiguring = False
 
         self._pipeline = AudioPipeline(
             on_state_change=self._on_pipeline_state_change,
@@ -157,7 +162,7 @@ class AudioCaptureService:
                         last_error=self._last_error if self._runtime_status() == PipelineState.ERROR else None,
                     )
 
-                if not self._simulate and not self._shutdown_event.is_set():
+                if not self._simulate and not self._shutdown_event.is_set() and not self._reconfiguring:
                     if self._pipeline.state == PipelineState.ERROR:
                         if self._pipeline_restart_count < self._max_pipeline_restarts:
                             self._pipeline_restart_count += 1
@@ -195,6 +200,8 @@ class AudioCaptureService:
         return self._cfg.is_push_transport
 
     def _runtime_status(self) -> str:
+        if self._reconfiguring:
+            return "RECONFIGURING"
         if self._waiting_for_target:
             return "WAITING_TARGET"
         if self._idle:
@@ -204,6 +211,8 @@ class AudioCaptureService:
         return self._pipeline.state
 
     def _runtime_healthy(self) -> bool:
+        if self._reconfiguring:
+            return False
         if self._waiting_for_target or self._idle:
             return True
         if self._simulate:
@@ -404,6 +413,72 @@ class AudioCaptureService:
             self._mqtt.publish_state(status, healthy=True, pid=os.getpid(), uptime_s=self._uptime_seconds())
             self._mqtt.publish_config_reported(self._cfg)
             self._mqtt.publish_endpoint(self._cfg)
+        else:
+            self._mqtt.publish_event(
+                "mute_rejected",
+                severity="warning",
+                details={"muted": muted, "pipeline_state": self._pipeline.state},
+            )
+
+    def _reconfigure_rode_mode(self, new_cfg: AudioCaptureConfig, delta: dict) -> bool:
+        """Cambia de modo RØDE sin mantener ALSA abierto durante el reset USB."""
+        previous_state = self._pipeline.state
+        should_start = (
+            previous_state in (PipelineState.RUNNING, PipelineState.PAUSED)
+            or (self._waiting_for_target and self._stream_target_confirmed)
+        )
+        self._reconfiguring = True
+        self._mqtt.publish_state("RECONFIGURING", healthy=False, pid=os.getpid())
+        self._mqtt.publish_event(
+            "rode_mode_reconfiguring",
+            details={"from": self._cfg.mqtt_rode_mode, "to": new_cfg.mqtt_rode_mode},
+        )
+
+        try:
+            # El cambio de modo desconecta el driver AUDIO_IF; el pipeline debe
+            # quedar totalmente liberado antes de tocar el USB.
+            if previous_state != PipelineState.STOPPED:
+                self._pipeline.stop()
+
+            with RodeController() as rode:
+                if not rode.is_available():
+                    raise RodeControllerError("RØDE AI-Micro no disponible para cambiar de modo")
+                rode.set_mode(new_cfg.rode_mode)
+
+            alsa_id = wait_for_alsa_capture_device(new_cfg.device_name)
+            if alsa_id is None:
+                raise RuntimeError("Timeout esperando la reenumeración ALSA del RØDE")
+
+            # El índice hw:X,Y puede cambiar después del reset USB.
+            self._cfg = replace(new_cfg, alsa_device_override=alsa_id)
+            self._mqtt._cfg = self._cfg
+            self._last_error = None
+
+            self._reconfiguring = False
+            if should_start and not self._start_pipeline(trigger="rode_mode_reconfigured"):
+                raise RuntimeError("El pipeline no entregó audio tras cambiar el modo RØDE")
+
+            self._mqtt.publish_config_reported(self._cfg)
+            self._mqtt.publish_endpoint(self._cfg)
+            self._mqtt.publish_stream_target(self._cfg, source="rode_mode_reconfigured")
+            self._mqtt.publish_event(
+                "rode_mode_reconfigured",
+                details={"mode": self._cfg.mqtt_rode_mode, "alsa_device": alsa_id},
+            )
+            return True
+        except Exception as e:
+            self._reconfiguring = False
+            self._last_error = str(e)
+            if self._pipeline.state != PipelineState.STOPPED:
+                self._pipeline.stop()
+            self._mqtt.publish_state("ERROR", healthy=False, pid=os.getpid(), last_error=self._last_error)
+            self._mqtt.publish_event(
+                "rode_mode_reconfigure_failed",
+                severity="error",
+                details={"error": self._last_error, "requested_mode": new_cfg.mqtt_rode_mode, "delta": delta},
+            )
+            logger.error(f"No se pudo reconfigurar el modo RØDE: {e}")
+            return False
 
     def _handle_apply_config(self, delta: dict) -> None:
         logger.info(f"Aplicando config delta: {delta}")
@@ -430,13 +505,11 @@ class AudioCaptureService:
             self._handle_mute(new_cfg.muted)
 
         if "rode_mode" in cold_changes and not self._simulate:
-            try:
-                with RodeController() as rode:
-                    if rode.is_available():
-                        rode.set_mode(new_cfg.rode_mode)
-                        logger.info(f"RODE actualizado en caliente a {new_cfg.rode_mode}")
-            except Exception as e:
-                logger.warning(f"No se pudo aplicar rode_mode en caliente: {e}")
+            if not self._reconfigure_rode_mode(new_cfg, delta):
+                return
+            self._mqtt.publish_event("config_applied", details={"delta": delta})
+            logger.info(f"Config aplicada: {delta}")
+            return
 
         self._cfg = new_cfg
         self._mqtt._cfg = new_cfg
@@ -470,7 +543,10 @@ class AudioCaptureService:
 
     def _on_pipeline_state_change(self, new_state: str) -> None:
         logger.debug(f"Pipeline state → {new_state}")
-        if self._waiting_for_target:
+        if self._reconfiguring:
+            status = "RECONFIGURING"
+            healthy = False
+        elif self._waiting_for_target:
             status = "WAITING_TARGET"
             healthy = True
         elif self._idle:

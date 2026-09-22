@@ -226,6 +226,20 @@ card 2: Micro [RØDE AI-Micro], device 0: USB Audio [USB Audio]
         self.assertIn("hw:0,0", alsa_ids)
         print(f"  ✓ list_alsa_capture_devices parsea {len(devices)} dispositivos")
 
+    def test_wait_for_capture_device_requires_openable_alsa(self):
+        """La reenumeración sólo termina cuando ALSA acepta abrir el RØDE."""
+        from audio_capture_service import device_discovery as dd
+        import unittest.mock as mock
+
+        with mock.patch.object(dd, "find_alsa_device_by_name", return_value="hw:3,0") as find_device, \
+             mock.patch.object(dd, "validate_alsa_device", return_value=True) as validate:
+            result = dd.wait_for_alsa_capture_device("AI-Micro", timeout_seconds=0.1)
+
+        self.assertEqual(result, "hw:3,0")
+        find_device.assert_called_once_with("AI-Micro", log_missing=False)
+        validate.assert_called_once_with("hw:3,0")
+        print("  ✓ Espera ALSA confirma que el dispositivo es abrible")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -288,6 +302,19 @@ class TestPipelineString(unittest.TestCase):
         s = pipeline._build_pipeline_string(cfg)
         self.assertIn("volume name=vol", s)
         print(f"  ✓ Pipeline tiene elemento volume: OK")
+
+    def test_pipeline_waits_for_first_buffer(self):
+        from audio_capture_service.pipeline import AudioPipeline
+        pipeline = AudioPipeline()
+        s = pipeline._build_pipeline_string(self._make_cfg())
+        self.assertIn("identity name=first_buffer signal-handoffs=true", s)
+        print("  ✓ Pipeline exige el primer buffer antes de declararse activo")
+
+    def test_mute_is_rejected_without_operational_pipeline(self):
+        from audio_capture_service.pipeline import AudioPipeline
+        pipeline = AudioPipeline()
+        self.assertFalse(pipeline.set_mute(True))
+        print("  ✓ mute no puede ocultar un pipeline detenido")
 
     def test_pipeline_has_queue_with_time(self):
         from audio_capture_service.pipeline import AudioPipeline

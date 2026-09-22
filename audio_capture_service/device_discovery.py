@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 #  Descubrimiento ALSA
 # ─────────────────────────────────────────────────────────────────────────────
 
-def find_alsa_device_by_name(name_substring: str) -> Optional[str]:
+def find_alsa_device_by_name(name_substring: str, *, log_missing: bool = True) -> Optional[str]:
     """
     Busca un dispositivo de captura ALSA por nombre parcial.
 
@@ -68,7 +68,37 @@ def find_alsa_device_by_name(name_substring: str) -> Optional[str]:
                 logger.info(f"Dispositivo '{name_substring}' encontrado (fuzzy): {alsa_dev}")
                 return alsa_dev
 
-    logger.warning(f"Dispositivo '{name_substring}' no encontrado en arecord -l")
+    if log_missing:
+        logger.warning(f"Dispositivo '{name_substring}' no encontrado en arecord -l")
+    return None
+
+
+def wait_for_alsa_capture_device(name_substring: str, *, timeout_seconds: float = 15.0,
+                                 poll_interval_seconds: float = 0.5) -> Optional[str]:
+    """Espera a que un capturador ALSA vuelva a estar disponible y sea abrible.
+
+    Un cambio de modo del RØDE reinicia el dispositivo USB. Encontrar su tarjeta
+    en ``arecord -l`` no basta: el driver puede seguir reenumerando y rechazar
+    la primera apertura. Esta función evita construir GStreamer sobre ese
+    estado transitorio.
+    """
+    import time
+
+    deadline = time.monotonic() + timeout_seconds
+    last_alsa_id: Optional[str] = None
+    while time.monotonic() < deadline:
+        alsa_id = find_alsa_device_by_name(name_substring, log_missing=False)
+        if alsa_id:
+            last_alsa_id = alsa_id
+            if validate_alsa_device(alsa_id):
+                logger.info(f"Dispositivo ALSA listo tras reenumeración: {alsa_id}")
+                return alsa_id
+        time.sleep(poll_interval_seconds)
+
+    if last_alsa_id:
+        logger.warning(f"'{name_substring}' reapareció como {last_alsa_id}, pero no quedó listo para captura")
+    else:
+        logger.warning(f"Timeout esperando que '{name_substring}' reaparezca en ALSA")
     return None
 
 
